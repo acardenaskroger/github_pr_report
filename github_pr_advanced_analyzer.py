@@ -6,12 +6,16 @@ GitHub PR Advanced Analyzer
 
 Features:
 1. Dual Input Modes:
-   - Direct REST API mode (from source.json)
-   - Excel input mode (loads existing 2026Q1_GitAnalysis.xlsx output from basic script)
-2. Human-Centric Risk Calibration & Small-PR Guardrails
-3. Comment Taxonomy & Keyword Risk Analysis (Defects, Arch, Refactor, Lint, Test)
-4. Bot Account Isolation (Dependabot, Renovate, etc.)
-5. Metrics Glossary & Methodology final page in PDF and Excel
+   - Direct REST API mode (from source.yml / source.json)
+   - Excel input mode (loads existing 2026Q1_GitAnalysis.xlsx)
+2. Unified Token Resolution (single GITHUB_TOKEN environment variable / .env)
+3. Human-Centric Risk Calibration & Small-PR Guardrails
+4. Comment Taxonomy & Keyword Risk Analysis (Defects, Arch, Refactor, Lint, Test)
+5. Reviewer tracking (REVIEWERS)
+6. PR Type Classification (PR_TYPE: Feature, Bugfix, Refactor, Chore, Docs, etc.)
+7. PR Type Breakdown Pie Chart in Executive PDF
+8. Cross-Team Rework Ratio Comparison Bar Chart in PDF & Excel
+9. Metrics Glossary & Methodology final page in PDF and Excel
 """
 
 import argparse
@@ -21,16 +25,34 @@ import os
 import re
 import statistics
 import time
+import warnings
 from datetime import datetime, time as datetime_time, timezone
 from pathlib import Path
 from typing import Any, Optional, Tuple, Dict, List
+
+# Suppress LibreSSL/urllib3 compatibility warning on macOS
+warnings.filterwarnings("ignore", category=UserWarning, module="urllib3")
 
 import pandas as pd
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# ReportLab imports for PDF generation
+# Optional .env support
+try:
+    from dotenv import load_dotenv
+    DOTENV_AVAILABLE = True
+except ImportError:
+    DOTENV_AVAILABLE = False
+
+# Optional YAML support
+try:
+    import yaml
+    YAML_AVAILABLE = True
+except ImportError:
+    YAML_AVAILABLE = False
+
+# ReportLab imports for PDF generation and visual charts
 try:
     from reportlab.lib import colors
     from reportlab.lib.pagesizes import letter
@@ -46,12 +68,16 @@ try:
         Table,
         TableStyle,
     )
+    from reportlab.graphics.shapes import Drawing
+    from reportlab.graphics.charts.piecharts import Pie
+    from reportlab.graphics.charts.barcharts import VerticalBarChart
+    from reportlab.graphics.charts.legends import Legend
     REPORTLAB_AVAILABLE = True
 except ImportError:
     REPORTLAB_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
-# Logging setup
+# Logging Setup
 # ---------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
@@ -68,7 +94,11 @@ DEFAULT_CONFIG_PATH = SCRIPT_DIR / "source.json"
 DEFAULT_INPUT_EXCEL = SCRIPT_DIR / "2026Q1_GitAnalysis.xlsx"
 OUTPUT_EXCEL_PATH = SCRIPT_DIR / "2026Q1_GitAnalysis_Advanced.xlsx"
 OUTPUT_PDF_PATH = SCRIPT_DIR / "GitHub_Executive_Report.pdf"
-OUTPUT_HTML_PATH = SCRIPT_DIR / "GitHub_Executive_Report.html"
+
+# Load .env if present
+ENV_PATH = SCRIPT_DIR / ".env"
+if ENV_PATH.exists() and DOTENV_AVAILABLE:
+    load_dotenv(dotenv_path=ENV_PATH, override=True)
 
 GITHUB_API_BASE = "https://api.github.com"
 GITHUB_API_VERSION = "2022-11-28"
@@ -91,9 +121,6 @@ KNOWN_BOTS = {
     "atlassian-bitbucket-cloud[bot]",
 }
 
-# ---------------------------------------------------------------------------
-# Keyword Taxonomy Patterns (Word-Boundary Strict)
-# ---------------------------------------------------------------------------
 TAXONOMY_PATTERNS = {
     "DEFECT_CRITICAL": re.compile(
         r"\b(bug|error|fail|failure|broken|defect|vulnerability|security|crash|exception|nullpointer|leak|outage|flaw|regression)\b",
@@ -117,16 +144,56 @@ TAXONOMY_PATTERNS = {
     ),
 }
 
+CHART_PALETTE = [
+    colors.HexColor('#2B6CB0'),  # Blue (Feature)
+    colors.HexColor('#C53030'),  # Red (Bugfix)
+    colors.HexColor('#319795'),  # Teal (Refactor)
+    colors.HexColor('#D69E2E'),  # Yellow/Orange (Chore)
+    colors.HexColor('#805AD5'),  # Purple (Dependency)
+    colors.HexColor('#38A169'),  # Green (Testing)
+    colors.HexColor('#DD6B20'),  # Orange (Docs)
+    colors.HexColor('#4A5568'),  # Gray (Other)
+]
+
 
 # ---------------------------------------------------------------------------
-# Helper Functions
+# PR Type Classifier
 # ---------------------------------------------------------------------------
+def classify_pr_type(title: str, branch: str, labels: List[str], is_bot: bool) -> str:
+    """Classify PR into standardized engineering categories using title, branch, and labels."""
+    if is_bot:
+        return "DEPENDENCY_UPDATE"
+
+    labels_str = " ".join(labels).lower()
+    combined_text = f"{title} {branch} {labels_str}".lower()
+
+    if re.search(r"(^|\b)(feat|feature|story)([\/\(\:\s_-]|$)", combined_text):
+        return "FEATURE"
+    if re.search(r"(^|\b)(fix|bug|bugfix|hotfix|patch)([\/\(\:\s_-]|$)", combined_text):
+        return "BUGFIX"
+    if re.search(r"(^|\b)(refactor|cleanup|clean-up)([\/\(\:\s_-]|$)", combined_text):
+        return "REFACTOR"
+    if re.search(r"(^|\b)(perf|performance|optimize|optimization)([\/\(\:\s_-]|$)", combined_text):
+        return "PERFORMANCE"
+    if re.search(r"(^|\b)(test|tests|testing|coverage|cypress|jest|pytest)([\/\(\:\s_-]|$)", combined_text):
+        return "TESTING"
+    if re.search(r"(^|\b)(doc|docs|documentation|readme)([\/\(\:\s_-]|$)", combined_text):
+        return "DOCUMENTATION"
+    if re.search(r"(^|\b)(revert)([\/\(\:\s_-]|$)", combined_text):
+        return "REVERT"
+    if re.search(r"(^|\b)(chore|build|ci|cd|pipeline|deps|dependency|bump|release|config)([\/\(\:\s_-]|$)", combined_text):
+        return "CHORE / MAINTENANCE"
+
+    return "OTHER / GENERAL"
+
+
 def _build_session(token: str) -> requests.Session:
-    """Build a pre-configured requests session for GitHub API."""
+    """Build pre-configured requests session with retry strategies for GitHub API."""
     session = requests.Session()
+    if token:
+        session.headers.update({"Authorization": f"Bearer {token}"})
     session.headers.update(
         {
-            "Authorization": f"Bearer {token}",
             "X-GitHub-Api-Version": GITHUB_API_VERSION,
             "Accept": "application/vnd.github+json",
         }
@@ -143,13 +210,8 @@ def _build_session(token: str) -> requests.Session:
     return session
 
 
-def github_get(
-    session: requests.Session,
-    url: str,
-    params: Optional[dict] = None,
-    label: str = "",
-) -> requests.Response:
-    """Execute timed GET request with rate limit inspection and error handling."""
+def github_get(session: requests.Session, url: str, params: Optional[dict] = None, label: str = "") -> requests.Response:
+    """Execute timed GET request with rate limit handling and automatic wait-and-retry."""
     start_time = time.perf_counter()
     logger.debug("GET START %s params=%s", label or url, params)
 
@@ -161,18 +223,6 @@ def github_get(
         raise
 
     elapsed = time.perf_counter() - start_time
-    rem = response.headers.get("X-RateLimit-Remaining", "?")
-    limit = response.headers.get("X-RateLimit-Limit", "?")
-
-    logger.debug(
-        "GET END %s status=%d elapsed=%.2fs rate_limit=%s/%s",
-        label or url,
-        response.status_code,
-        elapsed,
-        rem,
-        limit,
-    )
-
     if response.status_code == 403 and "rate limit" in response.text.lower():
         reset_ts = int(response.headers.get("X-RateLimit-Reset", time.time() + 60))
         wait_secs = max(reset_ts - int(time.time()), 1)
@@ -185,11 +235,7 @@ def github_get(
 
 
 def parse_pr_url(pr_url: str) -> Tuple[str, str, int]:
-    """
-    Extract org, repo_name, and pr_number from a GitHub PR URL.
-    E.g., https://github.com/krogertechnology/payments-tokenization-api/pull/272
-    -> ('krogertechnology', 'payments-tokenization-api', 272)
-    """
+    """Extract org, repo_name, and pr_number from a GitHub PR URL."""
     match = re.search(r"github\.com/([^/]+)/([^/]+)/pull/(\d+)", pr_url)
     if not match:
         raise ValueError(f"Invalid GitHub PR URL format: {pr_url}")
@@ -199,49 +245,26 @@ def parse_pr_url(pr_url: str) -> Tuple[str, str, int]:
 # ---------------------------------------------------------------------------
 # Deep PR Detail Extractor
 # ---------------------------------------------------------------------------
-def enrich_pr_details(
-    session: requests.Session,
-    org: str,
-    repo_name: str,
-    pr_number: int,
-    base_info: dict,
-) -> dict:
-    """
-    Fetch deep PR metrics: reviews, comments, commits, additions, deletions,
-    human taxonomy analysis, rework counts, and risk classification.
-    """
+def enrich_pr_details(session: requests.Session, org: str, repo_name: str, pr_number: int, base_info: dict) -> dict:
+    """Fetch reviews, taxonomy comments, commits, additions/deletions, reviewers, and compute risk."""
     full_repo = f"{org}/{repo_name}"
     pr_label = f"{full_repo}#{pr_number}"
 
-    # 1. PR Detailed Object
-    pr_detail_url = f"{GITHUB_API_BASE}/repos/{full_repo}/pulls/{pr_number}"
-    res = github_get(session, pr_detail_url, label=f"PR details {pr_label}")
-    pr_data = res.json()
+    pr_data = github_get(session, f"{GITHUB_API_BASE}/repos/{full_repo}/pulls/{pr_number}", label=f"PR {pr_label}").json()
+    reviews = github_get(session, f"{GITHUB_API_BASE}/repos/{full_repo}/pulls/{pr_number}/reviews", label=f"Reviews {pr_label}").json()
+    review_comments = github_get(session, f"{GITHUB_API_BASE}/repos/{full_repo}/pulls/{pr_number}/comments", label=f"Comments {pr_label}").json()
+    issue_comments = github_get(session, f"{GITHUB_API_BASE}/repos/{full_repo}/issues/{pr_number}/comments", label=f"Issue comments {pr_label}").json()
+    commits = github_get(session, f"{GITHUB_API_BASE}/repos/{full_repo}/pulls/{pr_number}/commits", label=f"Commits {pr_label}").json()
 
-    # 2. Reviews
-    reviews_url = f"{GITHUB_API_BASE}/repos/{full_repo}/pulls/{pr_number}/reviews"
-    reviews_res = github_get(session, reviews_url, label=f"Reviews {pr_label}")
-    reviews = reviews_res.json()
+    pr_title = pr_data.get("title", "")
+    head_branch = pr_data.get("head", {}).get("ref", "")
+    labels = [lb.get("name", "") for lb in pr_data.get("labels", []) if isinstance(lb, dict)]
 
-    # 3. Inline Review Comments
-    review_comments_url = f"{GITHUB_API_BASE}/repos/{full_repo}/pulls/{pr_number}/comments"
-    rev_comments_res = github_get(session, review_comments_url, label=f"Review comments {pr_label}")
-    review_comments = rev_comments_res.json()
-
-    # 4. PR Issue Comments (General)
-    issue_comments_url = f"{GITHUB_API_BASE}/repos/{full_repo}/issues/{pr_number}/comments"
-    issue_comments_res = github_get(session, issue_comments_url, label=f"Issue comments {pr_label}")
-    issue_comments = issue_comments_res.json()
-
-    # 5. Commits
-    commits_url = f"{GITHUB_API_BASE}/repos/{full_repo}/pulls/{pr_number}/commits"
-    commits_res = github_get(session, commits_url, label=f"Commits {pr_label}")
-    commits = commits_res.json()
-
-    # Base Fields
     author = pr_data.get("user", {}).get("login", base_info.get("CREATED_USER_NAME", "unknown"))
     author_type = pr_data.get("user", {}).get("type", "User")
     is_bot = (author.lower() in KNOWN_BOTS) or (author_type == "Bot") or ("[bot]" in author.lower())
+
+    pr_type = classify_pr_type(pr_title, head_branch, labels, is_bot)
 
     created_at = datetime.strptime(pr_data["created_at"], GH_DATE_FMT)
     merged_at_str = pr_data.get("merged_at")
@@ -251,22 +274,11 @@ def enrich_pr_details(
     closed_at = datetime.strptime(closed_at_str, GH_DATE_FMT) if closed_at_str else None
     end_time = merged_at or closed_at or datetime.now(timezone.utc)
 
-    # Lead Time
     lead_time_hrs = round((end_time - created_at).total_seconds() / 3600, 2)
 
-    # First Review & TTFR
-    human_reviews = [
-        r for r in reviews
-        if r.get("user", {}).get("type") != "Bot" and r.get("user", {}).get("login") != author
-    ]
-    human_inline_comments = [
-        c for c in review_comments
-        if c.get("user", {}).get("type") != "Bot" and c.get("user", {}).get("login") != author
-    ]
-    human_issue_comments = [
-        c for c in issue_comments
-        if c.get("user", {}).get("type") != "Bot" and c.get("user", {}).get("login") != author
-    ]
+    human_reviews = [r for r in reviews if r.get("user", {}).get("type") != "Bot" and r.get("user", {}).get("login") != author]
+    human_inline_comments = [c for c in review_comments if c.get("user", {}).get("type") != "Bot" and c.get("user", {}).get("login") != author]
+    human_issue_comments = [c for c in issue_comments if c.get("user", {}).get("type") != "Bot" and c.get("user", {}).get("login") != author]
 
     all_review_timestamps = []
     for r in human_reviews:
@@ -279,7 +291,6 @@ def enrich_pr_details(
     first_review_at = min(all_review_timestamps) if all_review_timestamps else None
     ttfr_hrs = round((first_review_at - created_at).total_seconds() / 3600, 2) if first_review_at else None
 
-    # Review Cycle Time & Merge Delay
     approval_timestamps = [
         datetime.strptime(r["submitted_at"], GH_DATE_FMT)
         for r in human_reviews
@@ -290,22 +301,22 @@ def enrich_pr_details(
     review_cycle_hrs = round((first_approval_at - first_review_at).total_seconds() / 3600, 2) if (first_approval_at and first_review_at and first_approval_at >= first_review_at) else None
     merge_delay_hrs = round((end_time - first_approval_at).total_seconds() / 3600, 2) if (first_approval_at and end_time >= first_approval_at) else None
 
-    # Code Size
     additions = pr_data.get("additions", 0)
     deletions = pr_data.get("deletions", 0)
     changed_files = pr_data.get("changed_files", 0)
     total_lines = additions + deletions
 
-    # Reviewers Count & Review Rounds
-    unique_reviewers = {
+    unique_reviewers_set = {
         r.get("user", {}).get("login") for r in human_reviews if r.get("user", {}).get("login")
     }.union({
         c.get("user", {}).get("login") for c in human_inline_comments if c.get("user", {}).get("login")
     })
-    reviewers_count = len(unique_reviewers)
+
+    unique_reviewers_list = sorted([u for u in unique_reviewers_set if u and u != author])
+    reviewers_str = ", ".join(unique_reviewers_list) if unique_reviewers_list else "None"
+    reviewers_count = len(unique_reviewers_list)
     review_rounds = len([r for r in human_reviews if r.get("state") in ("APPROVED", "CHANGES_REQUESTED")])
 
-    # Commits & Post-Review Rework
     total_commits = len(commits)
     commits_after_first_review = 0
     if first_review_at and commits:
@@ -318,7 +329,6 @@ def enrich_pr_details(
 
     rework_ratio_pct = round((commits_after_first_review / max(total_commits, 1)) * 100, 1)
 
-    # Human-Only Comment Taxonomy Keyword Parsing
     all_human_comment_bodies = [c.get("body", "") for c in human_inline_comments + human_issue_comments]
     taxonomy_counts = {key: 0 for key in TAXONOMY_PATTERNS}
     matched_keywords = {key: set() for key in TAXONOMY_PATTERNS}
@@ -332,11 +342,8 @@ def enrich_pr_details(
 
     defect_comments_count = taxonomy_counts["DEFECT_CRITICAL"]
     arch_comments_count = taxonomy_counts["ARCH_DESIGN"]
-
-    # Review Defect Density (defects per 100 lines)
     defect_density = round((defect_comments_count / max(total_lines, 1)) * 100, 2)
 
-    # Rework Classification
     if commits_after_first_review > 0:
         if defect_comments_count > 0 or arch_comments_count > 0:
             rework_category = "CRITICAL_REWORK"
@@ -345,7 +352,6 @@ def enrich_pr_details(
     else:
         rework_category = "NO_REWORK"
 
-    # Human-Centric Risk Calibration & Small-PR Guardrail
     severity_score = round(
         (total_lines * 0.1)
         + (changed_files * 2.0)
@@ -354,10 +360,9 @@ def enrich_pr_details(
         1
     )
 
-    # Risk Level Evaluation
     if is_bot:
         risk_level = "LOW"
-        risk_explanation = "LOW RISK: AUTOMATED UPDATE: Dependabot/Bot dependency bump (excluded from human defect & team review metrics)."
+        risk_explanation = "LOW RISK: AUTOMATED UPDATE: Bot dependency bump (isolated from human metrics)."
     elif total_lines <= 50 and changed_files <= 3 and defect_comments_count == 0:
         risk_level = "LOW"
         risk_explanation = f"LOW RISK: Small, clean changeset ({total_lines} lines in {changed_files} files) merged in {lead_time_hrs}h with 0 defect comments."
@@ -380,10 +385,13 @@ def enrich_pr_details(
         "TEAM": base_info.get("TEAM", "Unknown"),
         "REPO_NAME": repo_name,
         "PR_NUMBER": pr_number,
+        "PR_TITLE": pr_title,
+        "PR_TYPE": pr_type,
         "PR_ID": pr_data.get("id"),
         "PR_URL": pr_data.get("html_url"),
         "IS_BOT": is_bot,
         "AUTHOR": author,
+        "REVIEWERS": reviewers_str,
         "STATUS": "MERGED" if merged_at else "CLOSED_UNMERGED",
         "PR_CREATED_AT": pr_data["created_at"],
         "PR_MERGED_AT": merged_at_str or "",
@@ -415,13 +423,10 @@ def enrich_pr_details(
 
 
 # ---------------------------------------------------------------------------
-# Input Handler: Excel Input Mode
+# Data Loaders (Excel & Direct API)
 # ---------------------------------------------------------------------------
 def load_prs_from_excel(excel_path: Path, token: str) -> List[dict]:
-    """
-    Read PRs directly from the Raw_Data sheet of 2026Q1_GitAnalysis.xlsx,
-    then call GitHub API for deep metrics.
-    """
+    """Read PRs directly from the Raw_Data sheet of 2026Q1_GitAnalysis.xlsx."""
     if not excel_path.exists():
         raise FileNotFoundError(f"Input Excel file not found: {excel_path}")
 
@@ -453,21 +458,27 @@ def load_prs_from_excel(excel_path: Path, token: str) -> List[dict]:
     return enriched_prs
 
 
-# ---------------------------------------------------------------------------
-# Input Handler: Direct REST API Mode
-# ---------------------------------------------------------------------------
 def load_prs_from_api(config_path: Path) -> List[dict]:
-    """
-    Load repos from source.json, query GitHub for closed PRs, pre-filter by date,
-    and fetch deep metrics.
-    """
+    """Load configuration from source.yml or source.json and query GitHub API."""
     if not config_path.exists():
-        raise FileNotFoundError(f"Config file not found: {config_path}")
+        for alt_ext in [".yml", ".yaml", ".json"]:
+            alt_path = config_path.with_suffix(alt_ext)
+            if alt_path.exists():
+                config_path = alt_path
+                break
+        else:
+            raise FileNotFoundError(f"Configuration file not found: {config_path}")
 
     with config_path.open("r", encoding="utf-8") as f:
-        source_data = json.load(f)
+        if config_path.suffix in [".yml", ".yaml"]:
+            if not YAML_AVAILABLE:
+                raise ImportError("PyYAML is required to read .yml files. Run: pip install pyyaml")
+            source_data = yaml.safe_load(f)
+        else:
+            source_data = json.load(f)
 
-    # Normalize teams schema
+    global_env_token = os.environ.get("GITHUB_TOKEN", "")
+
     team_configs = []
     if isinstance(source_data, dict) and "teams" in source_data:
         for t in source_data["teams"]:
@@ -475,12 +486,8 @@ def load_prs_from_api(config_path: Path) -> List[dict]:
             org = t.get("org", "krogertechnology")
             begin_date = t.get("begin_date", DEFAULT_BEGIN_DATE)
             end_date = t.get("end_date", DEFAULT_END_DATE)
-            token = t.get("token", "")
-            repos = t["repos"]
-
-            # Token resolution from ENV
-            env_key = team_name.upper().replace(" ", "_").replace("/", "_") + "_TOKEN"
-            resolved_token = os.environ.get(env_key, os.environ.get("GITHUB_TOKEN", token))
+            resolved_token = t.get("token") or global_env_token
+            repos = t.get("repos", [])
 
             for r in repos:
                 repo_name = r if isinstance(r, str) else r.get("repo")
@@ -508,18 +515,15 @@ def load_prs_from_api(config_path: Path) -> List[dict]:
         logger.info("Querying GitHub API for %s (Range: %s to %s)...", full_repo, cfg["BEGIN_DATE"], cfg["END_DATE"])
 
         if not token:
-            logger.error("Missing token for %s. Set PAYMENTS_TOKEN or GITHUB_TOKEN environment variable.", full_repo)
-            continue
+            logger.warning("No GITHUB_TOKEN provided for %s. Requests might hit rate limits or fail for private repos.", full_repo)
 
         session = _build_session(token)
-
-        # List Closed PRs
         page = 1
         matching_prs = []
 
         while True:
             url = f"{GITHUB_API_BASE}/repos/{full_repo}/pulls?state=closed&per_page=100&page={page}"
-            res = github_get(session, url, label=f"Fetch closed PRs page {page}")
+            res = github_get(session, url, label=f"Closed PRs page {page}")
             prs_page = res.json()
 
             if not prs_page:
@@ -540,7 +544,7 @@ def load_prs_from_api(config_path: Path) -> List[dict]:
                 break
             page += 1
 
-        logger.info("Found %d matching merged PRs in date range for %s", len(matching_prs), full_repo)
+        logger.info("Found %d merged PRs in date range for %s", len(matching_prs), full_repo)
 
         for idx, pr_item in enumerate(matching_prs, start=1):
             pr_num = pr_item["number"]
@@ -553,10 +557,42 @@ def load_prs_from_api(config_path: Path) -> List[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Analytics Aggregators
+# Aggregators
 # ---------------------------------------------------------------------------
+def compute_team_rework_breakdown(enriched_prs: List[dict]) -> pd.DataFrame:
+    """Compute cross-team rework and cycle metrics."""
+    df = pd.DataFrame(enriched_prs)
+    if df.empty:
+        return pd.DataFrame()
+
+    team_rows = []
+    for team_name, group in df.groupby("TEAM"):
+        total_prs = len(group)
+        human_group = group[~group["IS_BOT"]]
+        human_prs = len(human_group)
+
+        valid_lead = [p["LEAD_TIME_HRS"] for p in group.to_dict("records") if isinstance(p["LEAD_TIME_HRS"], (int, float))]
+        avg_lead = round(statistics.mean(valid_lead), 1) if valid_lead else 0.0
+
+        avg_rework = round(human_group["REWORK_RATIO_PCT"].mean(), 1) if not human_group.empty else 0.0
+        crit_rework = len(human_group[human_group["REWORK_CATEGORY"] == "CRITICAL_REWORK"])
+        total_defects = group["DEFECT_COMMENTS"].sum()
+
+        team_rows.append({
+            "TEAM": team_name,
+            "TOTAL_PRS": total_prs,
+            "HUMAN_PRS": human_prs,
+            "AVG_REWORK_PCT": avg_rework,
+            "CRITICAL_REWORK_PRS": crit_rework,
+            "AVG_LEAD_HRS": avg_lead,
+            "TOTAL_DEFECTS": total_defects,
+        })
+
+    return pd.DataFrame(team_rows).sort_values(by="AVG_REWORK_PCT", ascending=False)
+
+
 def compute_user_breakdown(enriched_prs: List[dict]) -> pd.DataFrame:
-    """Compute human contributor performance breakdown table."""
+    """Compute individual contributor performance metrics."""
     human_prs = [p for p in enriched_prs if not p["IS_BOT"]]
     if not human_prs:
         return pd.DataFrame()
@@ -579,7 +615,6 @@ def compute_user_breakdown(enriched_prs: List[dict]) -> pd.DataFrame:
         defects = group["DEFECT_COMMENTS"].sum()
         critical_rework_prs = len(group[group["REWORK_CATEGORY"] == "CRITICAL_REWORK"])
 
-        # Risk Profile Breakdown string (C/H/M/L)
         c_cnt = len(group[group["RISK_LEVEL"] == "CRITICAL"])
         h_cnt = len(group[group["RISK_LEVEL"] == "HIGH"])
         m_cnt = len(group[group["RISK_LEVEL"] == "MEDIUM"])
@@ -603,27 +638,136 @@ def compute_user_breakdown(enriched_prs: List[dict]) -> pd.DataFrame:
 
 
 def compute_top_5_rework(enriched_prs: List[dict]) -> pd.DataFrame:
-    """Identify top 5 PRs with highest rework ratio and commits post-review."""
+    """Identify top 5 PRs with highest post-review rework iterations."""
     df = pd.DataFrame(enriched_prs)
     if df.empty:
         return pd.DataFrame()
 
     df_rework = df.sort_values(by=["COMMITS_AFTER_REVIEW", "REWORK_RATIO_PCT", "DEFECT_COMMENTS"], ascending=False).head(5)
     cols = [
-        "PR_NUMBER", "REPO_NAME", "AUTHOR", "LEAD_TIME_HRS",
+        "PR_NUMBER", "PR_TYPE", "REPO_NAME", "AUTHOR", "REVIEWERS", "LEAD_TIME_HRS",
         "TOTAL_COMMITS", "COMMITS_AFTER_REVIEW", "REWORK_RATIO_PCT",
         "DEFECT_COMMENTS", "REWORK_CATEGORY", "RISK_LEVEL"
     ]
-    return df_rework[cols]
+    available_cols = [c for c in cols if c in df_rework.columns]
+    return df_rework[available_cols]
+
+
+def compute_pr_type_breakdown(enriched_prs: List[dict]) -> pd.DataFrame:
+    """Compute aggregated metrics grouped by PR type."""
+    df = pd.DataFrame(enriched_prs)
+    if df.empty:
+        return pd.DataFrame()
+
+    type_rows = []
+    for pr_type, group in df.groupby("PR_TYPE"):
+        total_count = len(group)
+        pct = round((total_count / len(df)) * 100, 1)
+        total_lines = group["TOTAL_LINES"].sum()
+
+        valid_lead = [p["LEAD_TIME_HRS"] for p in group.to_dict("records") if isinstance(p["LEAD_TIME_HRS"], (int, float))]
+        avg_lead = round(statistics.mean(valid_lead), 1) if valid_lead else 0.0
+        total_defects = group["DEFECT_COMMENTS"].sum()
+
+        type_rows.append({
+            "PR_TYPE": pr_type,
+            "COUNT": total_count,
+            "SHARE_PCT": pct,
+            "TOTAL_LINES": total_lines,
+            "AVG_LEAD_HRS": avg_lead,
+            "DEFECTS": total_defects,
+        })
+
+    return pd.DataFrame(type_rows).sort_values(by="COUNT", ascending=False)
 
 
 # ---------------------------------------------------------------------------
-# PDF Exporter (ReportLab with Final Glossary Page)
+# Visual Chart Generators & PDF Exporter (ReportLab)
 # ---------------------------------------------------------------------------
+def create_pr_type_pie_chart(df_types: pd.DataFrame) -> Drawing:
+    """Create styled ReportLab Pie Chart for PR type distribution."""
+    d = Drawing(480, 140)
+    if df_types.empty:
+        return d
+
+    pc = Pie()
+    pc.x = 20
+    pc.y = 5
+    pc.width = 120
+    pc.height = 120
+    pc.data = df_types["COUNT"].tolist()
+    pc.labels = [f"{cnt}" for cnt in df_types["COUNT"].tolist()]
+    pc.simpleLabels = 0
+
+    for i, color in enumerate(CHART_PALETTE[:len(df_types)]):
+        pc.slices[i].fillColor = color
+        pc.slices[i].strokeColor = colors.white
+        pc.slices[i].strokeWidth = 1
+
+    legend = Legend()
+    legend.x = 180
+    legend.y = 125
+    legend.dx = 10
+    legend.dy = 10
+    legend.fontName = "Helvetica"
+    legend.fontSize = 8
+    legend.boxAnchor = "nw"
+    legend.columnMaximum = 8
+    legend.strokeWidth = 0.5
+    legend.strokeColor = colors.transparent
+
+    legend_items = []
+    for i, (_, row) in enumerate(df_types.iterrows()):
+        legend_items.append((
+            CHART_PALETTE[i % len(CHART_PALETTE)],
+            f"{row['PR_TYPE']} — {row['COUNT']} PRs ({row['SHARE_PCT']}%)"
+        ))
+    legend.colorNamePairs = legend_items
+
+    d.add(pc)
+    d.add(legend)
+    return d
+
+
+def create_team_rework_bar_chart(df_teams: pd.DataFrame) -> Drawing:
+    """Create styled Vertical Bar Chart comparing average rework % by team."""
+    d = Drawing(480, 140)
+    if df_teams.empty:
+        return d
+
+    bc = VerticalBarChart()
+    bc.x = 40
+    bc.y = 25
+    bc.height = 95
+    bc.width = 400
+
+    rework_values = [float(v) for v in df_teams["AVG_REWORK_PCT"].tolist()]
+    bc.data = [rework_values]
+
+    bc.categoryAxis.categoryNames = [str(name)[:16] for name in df_teams["TEAM"].tolist()]
+    bc.categoryAxis.labels.fontSize = 8
+    bc.categoryAxis.labels.dy = -10
+    bc.categoryAxis.labels.fontName = "Helvetica-Bold"
+
+    max_val = max(rework_values) if rework_values else 100
+    bc.valueAxis.valueMin = 0
+    bc.valueAxis.valueMax = max(100, int(max_val * 1.25))
+    bc.valueAxis.valueStep = 25
+    bc.valueAxis.labels.fontSize = 7.5
+    bc.valueAxis.labels.fontName = "Helvetica"
+
+    bc.bars[0].fillColor = colors.HexColor('#C53030')
+    bc.bars[0].strokeColor = colors.white
+    bc.bars[0].strokeWidth = 0.5
+
+    d.add(bc)
+    return d
+
+
 def generate_pdf_report(enriched_prs: List[dict], pdf_path: Path):
-    """Generate multi-page Executive PDF report with Metrics Glossary final page."""
+    """Generate multi-page Executive PDF report with visual charts and methodology glossary."""
     if not REPORTLAB_AVAILABLE:
-        logger.warning("ReportLab not installed. Skipping PDF generation.")
+        logger.warning("ReportLab is not installed. Skipping PDF generation.")
         return
 
     doc = SimpleDocTemplate(
@@ -636,56 +780,17 @@ def generate_pdf_report(enriched_prs: List[dict], pdf_path: Path):
     )
 
     styles = getSampleStyleSheet()
-    title_style = ParagraphStyle(
-        "DocTitle",
-        parent=styles["Heading1"],
-        fontName="Helvetica-Bold",
-        fontSize=20,
-        leading=24,
-        textColor=colors.HexColor("#1A365D"),
-    )
-    h2_style = ParagraphStyle(
-        "SectionH2",
-        parent=styles["Heading2"],
-        fontName="Helvetica-Bold",
-        fontSize=13,
-        leading=17,
-        textColor=colors.HexColor("#2B6CB0"),
-        spaceBefore=10,
-        spaceAfter=6,
-    )
-    body_style = ParagraphStyle(
-        "BodyTextCustom",
-        parent=styles["Normal"],
-        fontName="Helvetica",
-        fontSize=8.5,
-        leading=11,
-        textColor=colors.HexColor("#2D3748"),
-    )
-    table_cell = ParagraphStyle(
-        "TableCell",
-        parent=styles["Normal"],
-        fontName="Helvetica",
-        fontSize=8,
-        leading=10,
-    )
-    table_header = ParagraphStyle(
-        "TableHeader",
-        parent=styles["Normal"],
-        fontName="Helvetica-Bold",
-        fontSize=8,
-        leading=10,
-        textColor=colors.white,
-    )
+    title_style = ParagraphStyle("DocTitle", parent=styles["Heading1"], fontName="Helvetica-Bold", fontSize=18, leading=22, textColor=colors.HexColor("#1A365D"))
+    h2_style = ParagraphStyle("SectionH2", parent=styles["Heading2"], fontName="Helvetica-Bold", fontSize=12, leading=15, textColor=colors.HexColor("#2B6CB0"), spaceBefore=8, spaceAfter=4)
+    body_style = ParagraphStyle("BodyTextCustom", parent=styles["Normal"], fontName="Helvetica", fontSize=8, leading=10.5, textColor=colors.HexColor("#2D3748"))
+    table_cell = ParagraphStyle("TableCell", parent=styles["Normal"], fontName="Helvetica", fontSize=7.5, leading=9.5)
+    table_header = ParagraphStyle("TableHeader", parent=styles["Normal"], fontName="Helvetica-Bold", fontSize=7.5, leading=9.5, textColor=colors.white)
 
     story = []
-
-    # Title & Banner
     story.append(Paragraph("GitHub Engineering Executive Analysis Dashboard", title_style))
-    story.append(Paragraph(f"<b>Generated:</b> {datetime.now().strftime('%Y-%m-%d %H:%M')} | <b>Period:</b> Q1 2026 Analysis", body_style))
-    story.append(Spacer(1, 10))
+    story.append(Paragraph(f"<b>Generated:</b> {datetime.now().strftime('%Y-%m-%d %H:%M')} | <b>Token:</b> Unified GITHUB_TOKEN", body_style))
+    story.append(Spacer(1, 8))
 
-    # KPI Summary Cards
     df = pd.DataFrame(enriched_prs)
     total_prs = len(df)
     merged_prs = len(df[df["STATUS"] == "MERGED"])
@@ -716,18 +821,72 @@ def generate_pdf_report(enriched_prs: List[dict], pdf_path: Path):
         ('BACKGROUND', (0,0), (-1,-1), colors.HexColor('#EDF2F7')),
         ('BOX', (0,0), (-1,-1), 1, colors.HexColor('#CBD5E0')),
         ('INNERGRID', (0,0), (-1,-1), 0.5, colors.HexColor('#CBD5E0')),
-        ('PADDING', (0,0), (-1,-1), 6),
+        ('PADDING', (0,0), (-1,-1), 4),
     ]))
     story.append(t_kpi)
-    story.append(Spacer(1, 12))
+    story.append(Spacer(1, 8))
 
-    # 1. Contributor Performance Table
-    story.append(Paragraph("1. Human Contributor Performance Breakdown", h2_style))
+    # Section 1: Cross-Team Rework Benchmark
+    story.append(Paragraph("1. Cross-Team Rework Ratio Benchmark (%)", h2_style))
+    df_teams = compute_team_rework_breakdown(enriched_prs)
+    if not df_teams.empty:
+        story.append(create_team_rework_bar_chart(df_teams))
+        story.append(Spacer(1, 4))
+        tm_headers = ["Team", "Total PRs", "Human PRs", "Avg Rework (%)", "Critical Rework", "Avg Lead (h)", "Defects"]
+        tm_rows = [[Paragraph(h, table_header) for h in tm_headers]]
+        for _, tm in df_teams.iterrows():
+            tm_rows.append([
+                Paragraph(f"<b>{tm['TEAM']}</b>", table_cell),
+                Paragraph(str(tm["TOTAL_PRS"]), table_cell),
+                Paragraph(str(tm["HUMAN_PRS"]), table_cell),
+                Paragraph(f"<b>{tm['AVG_REWORK_PCT']}%</b>", table_cell),
+                Paragraph(str(tm["CRITICAL_REWORK_PRS"]), table_cell),
+                Paragraph(f"{tm['AVG_LEAD_HRS']}h", table_cell),
+                Paragraph(str(tm["TOTAL_DEFECTS"]), table_cell),
+            ])
+        t_teams = Table(tm_rows, colWidths=[1.8*inch, 0.8*inch, 0.8*inch, 1.1*inch, 1.1*inch, 0.9*inch, 0.7*inch])
+        t_teams.setStyle(TableStyle([
+            ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#2B6CB0')),
+            ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor('#E2E8F0')),
+            ('PADDING', (0,0), (-1,-1), 3),
+        ]))
+        story.append(t_teams)
+
+    story.append(Spacer(1, 8))
+
+    # Section 2: PR Type Distribution
+    story.append(Paragraph("2. Pull Request Work Type Breakdown & Composition", h2_style))
+    df_types = compute_pr_type_breakdown(enriched_prs)
+    if not df_types.empty:
+        story.append(create_pr_type_pie_chart(df_types))
+        story.append(Spacer(1, 4))
+        pt_headers = ["PR Type", "Count", "Share (%)", "Total Lines Changed", "Avg Lead Time", "Defects"]
+        pt_rows = [[Paragraph(h, table_header) for h in pt_headers]]
+        for _, tr in df_types.iterrows():
+            pt_rows.append([
+                Paragraph(f"<b>{tr['PR_TYPE']}</b>", table_cell),
+                Paragraph(str(tr["COUNT"]), table_cell),
+                Paragraph(f"{tr['SHARE_PCT']}%", table_cell),
+                Paragraph(f"{tr['TOTAL_LINES']:,} lines", table_cell),
+                Paragraph(f"{tr['AVG_LEAD_HRS']}h", table_cell),
+                Paragraph(str(tr["DEFECTS"]), table_cell),
+            ])
+        t_types = Table(pt_rows, colWidths=[1.8*inch, 0.7*inch, 0.9*inch, 1.4*inch, 1.2*inch, 0.8*inch])
+        t_types.setStyle(TableStyle([
+            ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#2B6CB0')),
+            ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor('#E2E8F0')),
+            ('PADDING', (0,0), (-1,-1), 3),
+        ]))
+        story.append(t_types)
+
+    story.append(Spacer(1, 8))
+
+    # Section 3: Contributor Performance
+    story.append(Paragraph("3. Human Contributor Performance Breakdown", h2_style))
     df_user = compute_user_breakdown(enriched_prs)
     if not df_user.empty:
         u_headers = ["Author", "PRs", "Merged", "Avg Lead", "Avg TTFR", "Rework %", "Defects", "Crit Rework", "Risk Profile"]
         u_rows = [[Paragraph(h, table_header) for h in u_headers]]
-
         for _, u in df_user.iterrows():
             u_rows.append([
                 Paragraph(str(u["AUTHOR"]), table_cell),
@@ -740,79 +899,72 @@ def generate_pdf_report(enriched_prs: List[dict], pdf_path: Path):
                 Paragraph(str(u["CRITICAL_REWORK_PRS"]), table_cell),
                 Paragraph(str(u["RISK_PROFILE"]), table_cell),
             ])
-
         t_user = Table(u_rows, colWidths=[1.1*inch, 0.5*inch, 0.6*inch, 0.7*inch, 0.7*inch, 0.7*inch, 0.6*inch, 0.8*inch, 1.5*inch])
         t_user.setStyle(TableStyle([
             ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#2B6CB0')),
             ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor('#E2E8F0')),
-            ('PADDING', (0,0), (-1,-1), 4),
+            ('PADDING', (0,0), (-1,-1), 3),
         ]))
         story.append(t_user)
 
-    story.append(Spacer(1, 12))
+    story.append(Spacer(1, 8))
 
-    # 2. Top 5 High Rework Table
-    story.append(Paragraph("2. Top 5 High-Rework Pull Requests", h2_style))
+    # Section 4: Top 5 High Rework PRs
+    story.append(Paragraph("4. Top 5 High-Rework Pull Requests", h2_style))
     df_top_rework = compute_top_5_rework(enriched_prs)
     if not df_top_rework.empty:
-        r_headers = ["PR #", "Repo", "Author", "Lead (h)", "Total Commits", "Post Commits", "Rework %", "Defects", "Category", "Risk"]
+        r_headers = ["PR #", "Type", "Repo", "Author", "Reviewers", "Lead (h)", "Total Commits", "Post Commits", "Rework %", "Risk"]
         r_rows = [[Paragraph(h, table_header) for h in r_headers]]
-
         for _, r in df_top_rework.iterrows():
             r_rows.append([
                 Paragraph(f"#{r['PR_NUMBER']}", table_cell),
+                Paragraph(str(r.get('PR_TYPE', 'OTHER')), table_cell),
                 Paragraph(str(r['REPO_NAME']), table_cell),
                 Paragraph(str(r['AUTHOR']), table_cell),
+                Paragraph(str(r.get('REVIEWERS', 'None')), table_cell),
                 Paragraph(f"{r['LEAD_TIME_HRS']}h", table_cell),
                 Paragraph(str(r['TOTAL_COMMITS']), table_cell),
                 Paragraph(str(r['COMMITS_AFTER_REVIEW']), table_cell),
                 Paragraph(f"{r['REWORK_RATIO_PCT']}%", table_cell),
-                Paragraph(str(r['DEFECT_COMMENTS']), table_cell),
-                Paragraph(str(r['REWORK_CATEGORY']), table_cell),
                 Paragraph(str(r['RISK_LEVEL']), table_cell),
             ])
-
-        t_top = Table(r_rows, colWidths=[0.5*inch, 1.4*inch, 0.9*inch, 0.6*inch, 0.7*inch, 0.7*inch, 0.7*inch, 0.5*inch, 1.1*inch, 0.6*inch])
+        t_top = Table(r_rows, colWidths=[0.5*inch, 0.9*inch, 1.1*inch, 0.8*inch, 0.9*inch, 0.5*inch, 0.5*inch, 0.5*inch, 0.6*inch, 0.6*inch])
         t_top.setStyle(TableStyle([
             ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#C53030')),
             ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor('#E2E8F0')),
-            ('PADDING', (0,0), (-1,-1), 4),
+            ('PADDING', (0,0), (-1,-1), 3),
         ]))
         story.append(t_top)
 
-    story.append(Spacer(1, 12))
+    story.append(Spacer(1, 8))
 
-    # 3. Detailed Risk Insights Explanations
-    story.append(Paragraph("3. Detailed Executive Risk Insights & Explanations", h2_style))
-    d_headers = ["PR #", "Author", "Lines/Files", "Defects", "Risk Level", "Plain-Language Risk Explanation"]
+    # Section 5: Risk Insights & Explanations
+    story.append(Paragraph("5. Detailed Executive Risk Insights & Explanations", h2_style))
+    d_headers = ["PR #", "Type", "Author", "Lines/Files", "Defects", "Risk", "Plain-Language Risk Explanation"]
     d_rows = [[Paragraph(h, table_header) for h in d_headers]]
-
-    for p in enriched_prs[:15]:  # Top 15 PRs
+    for p in enriched_prs[:12]:
         d_rows.append([
             Paragraph(f"#{p['PR_NUMBER']}", table_cell),
+            Paragraph(str(p['PR_TYPE']), table_cell),
             Paragraph(str(p['AUTHOR']), table_cell),
             Paragraph(f"{p['TOTAL_LINES']}L / {p['CHANGED_FILES']}F", table_cell),
             Paragraph(str(p['DEFECT_COMMENTS']), table_cell),
             Paragraph(str(p['RISK_LEVEL']), table_cell),
             Paragraph(str(p['RISK_EXPLANATION']), table_cell),
         ])
-
-    t_detail = Table(d_rows, colWidths=[0.5*inch, 0.9*inch, 0.8*inch, 0.5*inch, 0.7*inch, 3.8*inch])
+    t_detail = Table(d_rows, colWidths=[0.5*inch, 0.8*inch, 0.8*inch, 0.8*inch, 0.5*inch, 0.6*inch, 3.2*inch])
     t_detail.setStyle(TableStyle([
         ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#2D3748')),
         ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor('#E2E8F0')),
-        ('PADDING', (0,0), (-1,-1), 4),
+        ('PADDING', (0,0), (-1,-1), 3),
     ]))
     story.append(t_detail)
 
-    # -----------------------------------------------------------------------
-    # PAGE BREAK -> DEDICATED METRICS GLOSSARY PAGE
-    # -----------------------------------------------------------------------
+    # PAGE BREAK -> METRICS GLOSSARY PAGE
     story.append(PageBreak())
-
     story.append(Paragraph("Metrics Calculation Methodology & Glossary", title_style))
     story.append(Paragraph("Comprehensive definitions, mathematical formulas, guardrails, and risk threshold rules.", body_style))
-    story.append(Spacer(1, 10))
+    story.append(Spacer(1, 8))
 
     g_headers = ["Metric Name", "Mathematical Formula / Rule", "Business Meaning & Purpose"]
     g_rows = [[Paragraph(h, table_header) for h in g_headers]]
@@ -820,9 +972,8 @@ def generate_pdf_report(enriched_prs: List[dict], pdf_path: Path):
     glossary_items = [
         ("PR Lead Time (hrs)", "t_merged/closed - t_created", "Total cycle time elapsed from PR creation until final merge or closure."),
         ("Time to 1st Review (TTFR)", "t_first_review - t_created", "Measures peer reviewer responsiveness and latency in starting code reviews."),
-        ("Review Cycle Time", "t_first_approval - t_first_review", "Active iteration duration spent in code review cycles between author and reviewers."),
-        ("Merge Delay", "t_merged - t_first_approval", "Idle latency between receiving final code approval and executing the merge."),
-        ("Rework Ratio (%)", "(Commits After 1st Review / Total Commits) * 100", "Proportion of total commits pushed after code review feedback was received."),
+        ("Cross-Team Rework Ratio", "Mean Rework % per Engineering Squad", "Benchmarks review efficiency and iteration overhead across distinct squads."),
+        ("PR Type Classification", "Regex matching on title, branch & labels", "Categorizes PRs into FEATURE, BUGFIX, REFACTOR, DEPENDENCY_UPDATE, CHORE, etc."),
         ("Small-PR Guardrail Rule", "Lines <= 50 & Files <= 3 & Defects == 0 -> LOW RISK", "Prevents small, clean PRs from being falsely flagged as HIGH risk due to high file multipliers."),
         ("Critical Rework vs Normal Rework", "Post-review commits + (Defect or Arch Comments > 0) -> CRITICAL_REWORK", "Isolates bug/defect-driven rework iterations from routine formatting, linting, and style nits."),
         ("Human-Only Comment Taxonomy", "Regex matching on human reviewer comments only (Bots excluded)", "Classifies feedback into DEFECT_CRITICAL, ARCH_DESIGN, REFACTOR, STYLE_LINT, and TEST_DOC."),
@@ -841,7 +992,7 @@ def generate_pdf_report(enriched_prs: List[dict], pdf_path: Path):
     t_glossary.setStyle(TableStyle([
         ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#1A365D')),
         ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor('#CBD5E0')),
-        ('PADDING', (0,0), (-1,-1), 5),
+        ('PADDING', (0,0), (-1,-1), 4),
     ]))
     story.append(t_glossary)
 
@@ -853,13 +1004,17 @@ def generate_pdf_report(enriched_prs: List[dict], pdf_path: Path):
 # Excel Exporter
 # ---------------------------------------------------------------------------
 def generate_excel_report(enriched_prs: List[dict], excel_path: Path):
-    """Write multi-tab Excel workbook including Metrics Glossary tab."""
+    """Write multi-tab Excel workbook including PR_TYPE, Team Breakdown, and Glossary."""
     df_detail = pd.DataFrame(enriched_prs)
+    df_teams = compute_team_rework_breakdown(enriched_prs)
     df_user = compute_user_breakdown(enriched_prs)
     df_rework = compute_top_5_rework(enriched_prs)
+    df_types = compute_pr_type_breakdown(enriched_prs)
 
     glossary_data = [
         {"Metric Name": "PR Lead Time (hrs)", "Formula / Rule": "t_merged/closed - t_created", "Business Purpose": "Total cycle time from PR creation to merge."},
+        {"Metric Name": "Cross-Team Rework Ratio", "Formula / Rule": "Mean Rework % across squad", "Business Purpose": "Benchmarks team review iteration efficiency."},
+        {"Metric Name": "PR Type Classification", "Formula / Rule": "Regex on Title/Branch/Labels", "Business Purpose": "Categorizes work into Feature, Bugfix, Refactor, Chore, etc."},
         {"Metric Name": "Time to 1st Review (TTFR)", "Formula / Rule": "t_first_review - t_created", "Business Purpose": "Reviewer responsiveness and latency."},
         {"Metric Name": "Small-PR Guardrail", "Formula / Rule": "Lines <= 50 & Files <= 3 & Defects == 0 -> LOW", "Business Purpose": "Prevents small, clean PRs from false high risk flags."},
         {"Metric Name": "Critical Rework", "Formula / Rule": "Post-review commits + Defect/Arch comments", "Business Purpose": "Isolates bug-driven rework from style nits."},
@@ -870,6 +1025,10 @@ def generate_excel_report(enriched_prs: List[dict], excel_path: Path):
 
     with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
         df_detail.to_excel(writer, sheet_name="Detailed_PR_Metrics", index=False)
+        if not df_teams.empty:
+            df_teams.to_excel(writer, sheet_name="Team_Rework_Breakdown", index=False)
+        if not df_types.empty:
+            df_types.to_excel(writer, sheet_name="PR_Type_Breakdown", index=False)
         if not df_user.empty:
             df_user.to_excel(writer, sheet_name="User_Breakdown", index=False)
         if not df_rework.empty:
@@ -885,18 +1044,17 @@ def generate_excel_report(enriched_prs: List[dict], excel_path: Path):
 def main():
     parser = argparse.ArgumentParser(description="GitHub PR Advanced Analyzer (Dual Input Version)")
     parser.add_argument("--excel", "-e", type=Path, help="Path to input Excel file (e.g. 2026Q1_GitAnalysis.xlsx)")
-    parser.add_argument("--config", "-c", type=Path, default=DEFAULT_CONFIG_PATH, help="Path to JSON config file (default: source.json)")
+    parser.add_argument("--config", "-c", type=Path, default=DEFAULT_CONFIG_PATH, help="Path to JSON/YML config file (default: source.json)")
     args = parser.parse_args()
 
     pipeline_start = time.perf_counter()
     logger.info("Starting GitHub PR Advanced Analyzer...")
 
+    token = os.environ.get("GITHUB_TOKEN", "")
     enriched_prs = []
 
-    # Decision Logic for Input Mode
     if args.excel or DEFAULT_INPUT_EXCEL.exists():
         input_excel = args.excel or DEFAULT_INPUT_EXCEL
-        token = os.environ.get("PAYMENTS_TOKEN", os.environ.get("GITHUB_TOKEN", ""))
 
         if not token and DEFAULT_CONFIG_PATH.exists():
             try:
@@ -909,7 +1067,7 @@ def main():
 
         logger.info("INPUT MODE: EXCEL INPUT (%s)", input_excel)
         if not token:
-            logger.warning("No GitHub token found in env (PAYMENTS_TOKEN/GITHUB_TOKEN). API requests may fail if repos are private.")
+            logger.warning("No GITHUB_TOKEN found. API requests may fail if repos are private or rate-limited.")
 
         enriched_prs = load_prs_from_excel(input_excel, token)
     else:
