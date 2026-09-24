@@ -1,0 +1,14 @@
+{
+  "teams": [
+    {
+      "team": "payments",
+      "begin_date": "2026-05-23",
+      "end_date": "2026-08-25",
+      "techm_members": ["@TomaszFenczyszyn"],
+      "tech_lead": ["@ranganath-kore-kr"],
+      "repos": [
+        "payments-tokenization-api"
+      ]
+    }
+  ]
+}
